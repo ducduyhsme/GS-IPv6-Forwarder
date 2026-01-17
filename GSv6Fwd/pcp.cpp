@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #define _CRT_RAND_S
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdlib.h>
@@ -14,6 +15,54 @@
 #include <assert.h>
 #include <stdio.h>
 
+#else // Linux
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+typedef int SOCKET;
+#define INVALID_SOCKET (-1)
+#define SOCKET_ERROR (-1)
+#define closesocket close
+
+typedef struct sockaddr_in SOCKADDR_IN;
+typedef struct sockaddr_in* PSOCKADDR_IN;
+typedef struct sockaddr_in6 SOCKADDR_IN6;
+typedef struct sockaddr_in6* PSOCKADDR_IN6;
+typedef struct sockaddr_storage SOCKADDR_STORAGE;
+typedef struct sockaddr_storage* PSOCKADDR_STORAGE;
+typedef unsigned char BYTE;
+
+// Simple hash function for Linux (replacement for Windows HashData)
+static void HashData(const BYTE* data, int dataLen, unsigned char* output, int outputLen)
+{
+    // Simple FNV-1a hash
+    unsigned int hash = 2166136261u;
+    for (int i = 0; i < dataLen; i++) {
+        hash ^= data[i];
+        hash *= 16777619u;
+    }
+    
+    // Fill output with hash-derived bytes
+    for (int i = 0; i < outputLen; i++) {
+        output[i] = (hash >> ((i % 4) * 8)) & 0xFF;
+        if ((i % 4) == 3) {
+            hash = hash * 16777619u + i;
+        }
+    }
+}
+
+#endif // _WIN32
+
 #define RECV_TIMEOUT_SEC 3
 
 #define PCP_VERSION 2
@@ -22,7 +71,9 @@
 
 #define CODE_PREFER_FAILURE 2
 
+#ifdef _WIN32
 #pragma pack(push, 1)
+#endif
 
 typedef struct _PCP_REQUEST_HEADER {
     unsigned char version;
@@ -30,7 +81,11 @@ typedef struct _PCP_REQUEST_HEADER {
     unsigned short reserved;
     unsigned int lifetime;
     unsigned char localAddress[16];
-} PCP_REQUEST_HEADER, *PPCP_REQUEST_HEADER;
+}
+#ifdef __GNUC__
+__attribute__((packed))
+#endif
+PCP_REQUEST_HEADER, *PPCP_REQUEST_HEADER;
 
 typedef struct _PCP_RESPONSE_HEADER {
     unsigned char version;
@@ -40,13 +95,21 @@ typedef struct _PCP_RESPONSE_HEADER {
     unsigned int lifetime;
     unsigned int epoch;
     unsigned char reserved2[12];
-} PCP_RESPONSE_HEADER, *PPCP_RESPONSE_HEADER;
+}
+#ifdef __GNUC__
+__attribute__((packed))
+#endif
+PCP_RESPONSE_HEADER, *PPCP_RESPONSE_HEADER;
 
 typedef struct _PCP_OPTION_HEADER {
     unsigned char code;
     unsigned char reserved;
     unsigned short length;
-} PCP_OPTION_HEADER, *PPCP_OPTION_HEADER;
+}
+#ifdef __GNUC__
+__attribute__((packed))
+#endif
+PCP_OPTION_HEADER, *PPCP_OPTION_HEADER;
 
 typedef struct _PCP_MAP_REQUEST {
     PCP_REQUEST_HEADER hdr;
@@ -60,7 +123,11 @@ typedef struct _PCP_MAP_REQUEST {
 
     // We send PREFER_FAILURE too for MAP requests
     PCP_OPTION_HEADER preferFailureOption;
-} PCP_MAP_REQUEST, *PPCP_MAP_REQUEST;
+}
+#ifdef __GNUC__
+__attribute__((packed))
+#endif
+PCP_MAP_REQUEST, *PPCP_MAP_REQUEST;
 
 typedef struct _PCP_MAP_RESPONSE {
     PCP_RESPONSE_HEADER hdr;
@@ -71,9 +138,15 @@ typedef struct _PCP_MAP_RESPONSE {
     unsigned short internalPort;
     unsigned short externalPort;
     unsigned char externalAddress[16];
-} PCP_MAP_RESPONSE, *PPCP_MAP_RESPONSE;
+}
+#ifdef __GNUC__
+__attribute__((packed))
+#endif
+PCP_MAP_RESPONSE, *PPCP_MAP_RESPONSE;
 
+#ifdef _WIN32
 #pragma pack(pop)
+#endif
 
 static void populateMappingNonce(PPCP_MAP_REQUEST request, PSOCKADDR_STORAGE pcpAddr, int pcpAddrLen)
 {
@@ -138,7 +211,11 @@ bool PCPMapPort(PSOCKADDR_STORAGE localAddr, int localAddrLen, PSOCKADDR_STORAGE
 
     sock = socket(localAddr->ss_family, SOCK_DGRAM, IPPROTO_UDP);
     if (sock == INVALID_SOCKET) {
+#ifdef _WIN32
         printf("socket() failed: %d\n", WSAGetLastError());
+#else
+        printf("socket() failed: %d\n", errno);
+#endif
         return false;
     }
 
@@ -147,7 +224,11 @@ bool PCPMapPort(PSOCKADDR_STORAGE localAddr, int localAddrLen, PSOCKADDR_STORAGE
         // is opened correctly and that the PCP server doesn't refuse our mapping.
         ((PSOCKADDR_IN6)localAddr)->sin6_port = 0;
         if (bind(sock, (struct sockaddr*)localAddr, localAddrLen) == SOCKET_ERROR) {
+#ifdef _WIN32
             printf("bind() failed: %d\n", WSAGetLastError());
+#else
+            printf("bind() failed: %d\n", errno);
+#endif
             closesocket(sock);
             return false;
         }
@@ -155,12 +236,16 @@ bool PCPMapPort(PSOCKADDR_STORAGE localAddr, int localAddrLen, PSOCKADDR_STORAGE
 
     ((PSOCKADDR_IN)pcpAddr)->sin_port = htons(5351);
     if (connect(sock, (struct sockaddr*)pcpAddr, pcpAddrLen) == SOCKET_ERROR) {
+#ifdef _WIN32
         printf("connect() failed: %d\n", WSAGetLastError());
+#else
+        printf("connect() failed: %d\n", errno);
+#endif
         closesocket(sock);
         return false;
     }
 
-    reqMsg = {};
+    memset(&reqMsg, 0, sizeof(reqMsg));
     reqMsg.hdr.version = PCP_VERSION;
     reqMsg.hdr.opcode = OPCODE_MAP_REQUEST;
     reqMsg.hdr.lifetime = htonl(lifetime);
@@ -170,7 +255,8 @@ bool PCPMapPort(PSOCKADDR_STORAGE localAddr, int localAddrLen, PSOCKADDR_STORAGE
     reqMsg.internalPort = htons(port);
     reqMsg.externalPort = htons(port);
 
-    SOCKADDR_STORAGE noneAddr = {};
+    SOCKADDR_STORAGE noneAddr;
+    memset(&noneAddr, 0, sizeof(noneAddr));
     noneAddr.ss_family = localAddr->ss_family;
     populateAddressFromSockAddr(&noneAddr, reqMsg.externalAddress);
 
@@ -192,7 +278,11 @@ bool PCPMapPort(PSOCKADDR_STORAGE localAddr, int localAddrLen, PSOCKADDR_STORAGE
     for (i = 0; i < RECV_TIMEOUT_SEC; i++) {
         // Retransmit the request every second until the timeout elapses
         if (send(sock, (char *)&reqMsg, reqMsgLen, 0) == SOCKET_ERROR) {
+#ifdef _WIN32
             printf("send() failed: %d\n", WSAGetLastError());
+#else
+            printf("send() failed: %d\n", errno);
+#endif
             closesocket(sock);
             return false;
         }
@@ -205,13 +295,21 @@ bool PCPMapPort(PSOCKADDR_STORAGE localAddr, int localAddrLen, PSOCKADDR_STORAGE
         tv.tv_sec = 1;
         tv.tv_usec = 0;
 
-        int selectRes = select(0, &fds, nullptr, nullptr, &tv);
+#ifdef _WIN32
+        int selectRes = select(0, &fds, NULL, NULL, &tv);
+#else
+        int selectRes = select(sock + 1, &fds, NULL, NULL, &tv);
+#endif
         if (selectRes == 0) {
             // Timeout - continue looping
             continue;
         }
         else if (selectRes == SOCKET_ERROR) {
+#ifdef _WIN32
             printf("select() failed: %d\n", WSAGetLastError());
+#else
+            printf("select() failed: %d\n", errno);
+#endif
             closesocket(sock);
             return false;
         }
@@ -226,10 +324,14 @@ bool PCPMapPort(PSOCKADDR_STORAGE localAddr, int localAddrLen, PSOCKADDR_STORAGE
         goto fail;
     }
     else if (bytesRead == SOCKET_ERROR) {
+#ifdef _WIN32
         printf("Failed to read PCP response: %d\n", WSAGetLastError());
+#else
+        printf("Failed to read PCP response: %d\n", errno);
+#endif
         goto fail;
     }
-    else if (bytesRead < sizeof(resp.hdr)) {
+    else if (bytesRead < (int)sizeof(resp.hdr)) {
         printf("PCP message truncated: %d\n", bytesRead);
         goto fail;
     }
@@ -278,7 +380,11 @@ bool PCPMapPort(PSOCKADDR_STORAGE localAddr, int localAddrLen, PSOCKADDR_STORAGE
             reqMsg.externalPort = resp.hdr.externalPort;
             reqMsgLen = sizeof(reqMsg) - sizeof(reqMsg.preferFailureOption);
             if (send(sock, (char*)&reqMsg, reqMsgLen, 0) == SOCKET_ERROR) {
+#ifdef _WIN32
                 printf("Failed to unmap unexpected external port: %d\n", WSAGetLastError());
+#else
+                printf("Failed to unmap unexpected external port: %d\n", errno);
+#endif
             }
         }
         goto fail;
