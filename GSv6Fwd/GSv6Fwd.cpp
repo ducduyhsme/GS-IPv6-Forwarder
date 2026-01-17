@@ -1,5 +1,5 @@
+#ifdef _WIN32
 #define _CRT_SECURE_NO_WARNINGS
-
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 
@@ -18,16 +18,80 @@
 
 #pragma comment(lib, "miniupnpc.lib")
 #define MINIUPNP_STATICLIB
+
+#define SERVICE_NAME L"GSv6FwdSvc"
+#define GAA_INITIAL_SIZE 8192
+
+LPFN_WSARECVMSG WSARecvMsg;
+
+#else // Linux/Unix
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include <errno.h>
+#include <unistd.h>
+#include <signal.h>
+#include <time.h>
+#include <pthread.h>
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <sys/stat.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <ifaddrs.h>
+#include <netdb.h>
+
+// Linux type definitions for Windows compatibility
+typedef int SOCKET;
+#define INVALID_SOCKET (-1)
+#define SOCKET_ERROR (-1)
+#define CLOSE_SOCKET close
+#define closesocket close
+
+typedef struct sockaddr* PSOCKADDR;
+typedef struct sockaddr_in SOCKADDR_IN;
+typedef struct sockaddr_in* PSOCKADDR_IN;
+typedef struct sockaddr_in6 SOCKADDR_IN6;
+typedef struct sockaddr_in6* PSOCKADDR_IN6;
+typedef struct sockaddr_storage SOCKADDR_STORAGE;
+typedef struct sockaddr_storage* PSOCKADDR_STORAGE;
+typedef struct in_addr IN_ADDR;
+typedef struct in_addr* PIN_ADDR;
+typedef struct in6_addr IN6_ADDR;
+typedef unsigned long DWORD;
+typedef void* PVOID;
+typedef unsigned long ULONG;
+
+#define SD_SEND SHUT_WR
+#define SD_BOTH SHUT_RDWR
+#define ERROR_OUTOFMEMORY ENOMEM
+
+#define RtlZeroMemory(dest, len) memset((dest), 0, (len))
+#define RtlEqualMemory(a, b, len) (memcmp((a), (b), (len)) == 0)
+
+// recvmsg/sendmsg structures for Linux (equivalent to Windows WSAMSG)
+struct linux_iovec {
+    void* buf;
+    size_t len;
+};
+
+#endif // _WIN32
+
 #include <miniupnpc/miniupnpc.h>
 #include <miniupnpc/upnpcommands.h>
 #include <miniupnpc/upnperrors.h>
 
 #include "../version.h"
 
-#define SERVICE_NAME L"GSv6FwdSvc"
-#define GAA_INITIAL_SIZE 8192
-
-LPFN_WSARECVMSG WSARecvMsg;
+#ifndef ARRAYSIZE
+#define ARRAYSIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
 
 bool PCPMapPort(PSOCKADDR_STORAGE localAddr, int localAddrLen, PSOCKADDR_STORAGE pcpAddr, int pcpAddrLen, int proto, int port, bool enable, bool indefinite);
 
@@ -73,15 +137,23 @@ ForwardSocketData(SOCKET from, SOCKET to)
     return len;
 }
 
+#ifdef _WIN32
 DWORD
 WINAPI
 TcpRelayThreadProc(LPVOID Context)
+#else
+void*
+TcpRelayThreadProc(void* Context)
+#endif
 {
     PSOCKET_TUPLE tuple = (PSOCKET_TUPLE)Context;
     fd_set fds;
     int err;
     bool s1ReadShutdown = false;
     bool s2ReadShutdown = false;
+#ifndef _WIN32
+    int maxfd;
+#endif
 
     for (;;) {
         FD_ZERO(&fds);
@@ -97,7 +169,12 @@ TcpRelayThreadProc(LPVOID Context)
             break;
         }
 
+#ifdef _WIN32
         err = select(0, &fds, NULL, NULL, NULL);
+#else
+        maxfd = (tuple->s1 > tuple->s2) ? tuple->s1 : tuple->s2;
+        err = select(maxfd + 1, &fds, NULL, NULL, NULL);
+#endif
         if (err <= 0) {
             break;
         }
@@ -130,9 +207,14 @@ TcpRelayThreadProc(LPVOID Context)
     closesocket(tuple->s1);
     closesocket(tuple->s2);
     free(tuple);
+#ifdef _WIN32
     return 0;
+#else
+    return NULL;
+#endif
 }
 
+#ifdef _WIN32
 PIP_ADAPTER_ADDRESSES
 AllocAndGetAdaptersAddresses(ULONG Family, ULONG Flags)
 {
@@ -244,29 +326,108 @@ Exit:
     free(addresses);
     return;
 }
+#else // Linux implementation
 
+void
+FindLocalAddressBySocket(SOCKET s, PIN_ADDR targetAddress)
+{
+    struct ifaddrs *ifaddr, *ifa;
+    SOCKADDR_IN6 localSockAddr;
+    socklen_t localSockAddrLen;
+    char ifname[IF_NAMESIZE] = {0};
+    int foundInterface = 0;
+
+    // Default to loopback
+    targetAddress->s_addr = htonl(INADDR_LOOPBACK);
+
+    // Get local address of the accepted socket
+    localSockAddrLen = sizeof(localSockAddr);
+    if (getsockname(s, (struct sockaddr*)&localSockAddr, &localSockAddrLen) == -1) {
+        printf("getsockname() failed: %d\n", errno);
+        return;
+    }
+
+    if (getifaddrs(&ifaddr) == -1) {
+        printf("getifaddrs() failed: %d\n", errno);
+        return;
+    }
+
+    // First pass: find the interface with our IPv6 address
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+
+        if (ifa->ifa_addr->sa_family == AF_INET6) {
+            PSOCKADDR_IN6 ifaceAddrV6 = (PSOCKADDR_IN6)ifa->ifa_addr;
+            if (memcmp(&localSockAddr.sin6_addr, &ifaceAddrV6->sin6_addr, sizeof(struct in6_addr)) == 0) {
+                strncpy(ifname, ifa->ifa_name, IF_NAMESIZE - 1);
+                foundInterface = 1;
+                break;
+            }
+        }
+    }
+
+    if (!foundInterface) {
+        printf("Unable to find incoming interface\n");
+        freeifaddrs(ifaddr);
+        return;
+    }
+
+    // Second pass: find an IPv4 address on this interface
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+
+        if (ifa->ifa_addr->sa_family == AF_INET && strcmp(ifa->ifa_name, ifname) == 0) {
+            PSOCKADDR_IN ifaceAddrV4 = (PSOCKADDR_IN)ifa->ifa_addr;
+            *targetAddress = ifaceAddrV4->sin_addr;
+            break;
+        }
+    }
+
+    freeifaddrs(ifaddr);
+}
+#endif // _WIN32
+
+#ifdef _WIN32
 DWORD
 WINAPI
 TcpListenerThreadProc(LPVOID Context)
+#else
+void*
+TcpListenerThreadProc(void* Context)
+#endif
 {
     PLISTENER_TUPLE tuple = (PLISTENER_TUPLE)Context;
     SOCKET acceptedSocket, targetSocket;
     SOCKADDR_IN targetAddress;
     PSOCKET_TUPLE relayTuple;
+#ifdef _WIN32
     HANDLE thread;
+#else
+    pthread_t thread;
+#endif
 
     printf("TCP relay running for port %d\n", tuple->port);
 
     for (;;) {
         acceptedSocket = accept(tuple->listener, NULL, 0);
         if (acceptedSocket == INVALID_SOCKET) {
+#ifdef _WIN32
             printf("accept() failed: %d\n", WSAGetLastError());
+#else
+            printf("accept() failed: %d\n", errno);
+#endif
             break;
         }
 
         targetSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (targetSocket == INVALID_SOCKET) {
+#ifdef _WIN32
             printf("socket() failed: %d\n", WSAGetLastError());
+#else
+            printf("socket() failed: %d\n", errno);
+#endif
             closesocket(acceptedSocket);
             continue;
         }
@@ -278,7 +439,7 @@ TcpListenerThreadProc(LPVOID Context)
 
         if (connect(targetSocket, (PSOCKADDR)&targetAddress, sizeof(targetAddress)) == SOCKET_ERROR) {
             // FIXME: This can race with reopening stdout and cause a crash in the CRT
-            //printf("connect() failed: %d\n", WSAGetLastError());
+            //printf("connect() failed: %d\n", ...);
             closesocket(acceptedSocket);
             closesocket(targetSocket);
             continue;
@@ -294,6 +455,7 @@ TcpListenerThreadProc(LPVOID Context)
         relayTuple->s1 = acceptedSocket;
         relayTuple->s2 = targetSocket;
 
+#ifdef _WIN32
         thread = CreateThread(NULL, 0, TcpRelayThreadProc, relayTuple, 0, NULL);
         if (thread == NULL) {
             printf("CreateThread() failed: %d\n", GetLastError());
@@ -304,43 +466,85 @@ TcpListenerThreadProc(LPVOID Context)
         }
 
         CloseHandle(thread);
+#else
+        if (pthread_create(&thread, NULL, TcpRelayThreadProc, relayTuple) != 0) {
+            printf("pthread_create() failed: %d\n", errno);
+            closesocket(acceptedSocket);
+            closesocket(targetSocket);
+            free(relayTuple);
+            break;
+        }
+        pthread_detach(thread);
+#endif
     }
 
     closesocket(tuple->listener);
     free(tuple);
+#ifdef _WIN32
     return 0;
+#else
+    return NULL;
+#endif
 }
 
 int StartTcpRelay(unsigned short Port, SOCKET* Listener)
 {
     SOCKET listeningSocket;
     SOCKADDR_IN6 addr6;
-    HANDLE thread;
     PLISTENER_TUPLE tuple;
+#ifdef _WIN32
+    HANDLE thread;
     DWORD val;
+#else
+    pthread_t thread;
+    int val;
+#endif
 
     listeningSocket = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (listeningSocket == INVALID_SOCKET) {
+#ifdef _WIN32
         printf("socket() failed: %d\n", WSAGetLastError());
         return WSAGetLastError();
+#else
+        printf("socket() failed: %d\n", errno);
+        return errno;
+#endif
     }
 
+#ifdef _WIN32
     val = PROTECTION_LEVEL_UNRESTRICTED;
     if (setsockopt(listeningSocket, IPPROTO_IPV6, IPV6_PROTECTION_LEVEL, (char*)&val, sizeof(val)) == SOCKET_ERROR) {
         printf("setsockopt(IPV6_PROTECTION_LEVEL) failed: %d\n", WSAGetLastError());
     }
+#else
+    // On Linux, we don't need IPV6_PROTECTION_LEVEL, but we might want to set IPV6_V6ONLY to 0
+    val = 0;
+    if (setsockopt(listeningSocket, IPPROTO_IPV6, IPV6_V6ONLY, &val, sizeof(val)) == -1) {
+        printf("setsockopt(IPV6_V6ONLY) failed: %d\n", errno);
+    }
+#endif
 
     RtlZeroMemory(&addr6, sizeof(addr6));
     addr6.sin6_family = AF_INET6;
     addr6.sin6_port = htons(Port);
     if (bind(listeningSocket, (PSOCKADDR)&addr6, sizeof(addr6)) == SOCKET_ERROR) {
+#ifdef _WIN32
         printf("bind() failed: %d\n", WSAGetLastError());
         return WSAGetLastError();
+#else
+        printf("bind() failed: %d\n", errno);
+        return errno;
+#endif
     }
 
     if (listen(listeningSocket, SOMAXCONN) == SOCKET_ERROR) {
+#ifdef _WIN32
         printf("listen() failed: %d\n", WSAGetLastError());
         return WSAGetLastError();
+#else
+        printf("listen() failed: %d\n", errno);
+        return errno;
+#endif
     }
 
     tuple = (PLISTENER_TUPLE)malloc(sizeof(*tuple));
@@ -351,6 +555,7 @@ int StartTcpRelay(unsigned short Port, SOCKET* Listener)
     tuple->listener = *Listener = listeningSocket;
     tuple->port = Port;
 
+#ifdef _WIN32
     thread = CreateThread(NULL, 0, TcpListenerThreadProc, tuple, 0, NULL);
     if (thread == NULL) {
         printf("CreateThread() failed: %d\n", GetLastError());
@@ -358,9 +563,17 @@ int StartTcpRelay(unsigned short Port, SOCKET* Listener)
     }
 
     CloseHandle(thread);
+#else
+    if (pthread_create(&thread, NULL, TcpListenerThreadProc, tuple) != 0) {
+        printf("pthread_create() failed: %d\n", errno);
+        return errno;
+    }
+    pthread_detach(thread);
+#endif
     return 0;
 }
 
+#ifdef _WIN32
 int
 ForwardUdpPacketV4toV6(PUDP_TUPLE tuple,
                        WSABUF* sourceInfoControlBuffer,
@@ -587,10 +800,233 @@ int StartUdpRelay(unsigned short Port, SOCKET* Ipv4Socket, SOCKET* Ipv6Socket)
     return 0;
 }
 
+#else // Linux UDP relay implementation
+
+// Linux control message buffer structure
+typedef struct {
+    char* buf;
+    size_t len;
+} LinuxControlBuffer;
+
+int
+ForwardUdpPacketV4toV6(PUDP_TUPLE tuple,
+                       LinuxControlBuffer* sourceInfoControlBuffer,
+                       PSOCKADDR_IN6 targetAddress)
+{
+    char buffer[4096];
+    ssize_t len;
+    struct iovec iov;
+    struct msghdr msg;
+
+    iov.iov_base = buffer;
+    iov.iov_len = sizeof(buffer);
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    len = recvmsg(tuple->ipv4Socket, &msg, 0);
+    if (len < 0) {
+        printf("recvmsg() failed: %d\n", errno);
+        return errno;
+    }
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = targetAddress;
+    msg.msg_namelen = sizeof(*targetAddress);
+    iov.iov_len = len;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = sourceInfoControlBuffer->buf;
+    msg.msg_controllen = sourceInfoControlBuffer->len;
+
+    if (sendmsg(tuple->ipv6Socket, &msg, 0) < 0) {
+        printf("sendmsg() failed: %d\n", errno);
+        return errno;
+    }
+
+    return 0;
+}
+
+int
+ForwardUdpPacketV6toV4(PUDP_TUPLE tuple,
+                       PSOCKADDR_IN targetAddress,
+                       /* Out */ LinuxControlBuffer* destInfoControlBuffer,
+                       /* Out */ PSOCKADDR_IN6 sourceAddress)
+{
+    char buffer[4096];
+    ssize_t len;
+    struct iovec iov;
+    struct msghdr msg;
+
+    iov.iov_base = buffer;
+    iov.iov_len = sizeof(buffer);
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = sourceAddress;
+    msg.msg_namelen = sizeof(*sourceAddress);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = destInfoControlBuffer->buf;
+    msg.msg_controllen = destInfoControlBuffer->len;
+
+    len = recvmsg(tuple->ipv6Socket, &msg, 0);
+    if (len < 0) {
+        printf("recvmsg() failed: %d\n", errno);
+        return errno;
+    }
+
+    // Verify IPV6_PKTINFO is populated
+    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg && cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO) {
+        destInfoControlBuffer->len = msg.msg_controllen;
+    }
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = targetAddress;
+    msg.msg_namelen = sizeof(*targetAddress);
+    iov.iov_len = len;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    if (sendmsg(tuple->ipv4Socket, &msg, 0) < 0) {
+        printf("sendmsg() failed: %d\n", errno);
+        return errno;
+    }
+
+    return 0;
+}
+
+void*
+UdpRelayThreadProc(void* Context)
+{
+    PUDP_TUPLE tuple = (PUDP_TUPLE)Context;
+    fd_set fds;
+    int err;
+    SOCKADDR_IN6 lastRemote;
+    SOCKADDR_IN localTarget;
+    char lastSourceBuf[1024];
+    LinuxControlBuffer lastSource;
+    int maxfd;
+
+    printf("UDP relay running for port %d\n", tuple->port);
+
+    RtlZeroMemory(&localTarget, sizeof(localTarget));
+    localTarget.sin_family = AF_INET;
+    localTarget.sin_port = htons(tuple->port);
+    localTarget.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    RtlZeroMemory(&lastRemote, sizeof(lastRemote));
+    RtlZeroMemory(&lastSource, sizeof(lastSource));
+
+    maxfd = (tuple->ipv6Socket > tuple->ipv4Socket) ? tuple->ipv6Socket : tuple->ipv4Socket;
+
+    for (;;) {
+        FD_ZERO(&fds);
+
+        FD_SET(tuple->ipv6Socket, &fds);
+        FD_SET(tuple->ipv4Socket, &fds);
+
+        err = select(maxfd + 1, &fds, NULL, NULL, NULL);
+        if (err <= 0) {
+            break;
+        }
+        else if (FD_ISSET(tuple->ipv6Socket, &fds)) {
+            // Forwarding incoming IPv6 packets to the IPv4 port
+            lastSource.buf = lastSourceBuf;
+            lastSource.len = sizeof(lastSourceBuf);
+
+            ForwardUdpPacketV6toV4(tuple, &localTarget, &lastSource, &lastRemote);
+        }
+        else if (FD_ISSET(tuple->ipv4Socket, &fds)) {
+            // Forwarding incoming IPv4 packets to the last known IPv6 address
+            ForwardUdpPacketV4toV6(tuple, &lastSource, &lastRemote);
+        }
+    }
+
+    close(tuple->ipv6Socket);
+    close(tuple->ipv4Socket);
+    free(tuple);
+    return NULL;
+}
+
+int StartUdpRelay(unsigned short Port, SOCKET* Ipv4Socket, SOCKET* Ipv6Socket)
+{
+    SOCKET ipv6Socket;
+    SOCKET ipv4Socket;
+    SOCKADDR_IN6 addr6;
+    SOCKADDR_IN addr;
+    PUDP_TUPLE tuple;
+    pthread_t thread;
+    int val;
+
+    ipv6Socket = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+    if (ipv6Socket == INVALID_SOCKET) {
+        printf("socket() failed: %d\n", errno);
+        return errno;
+    }
+
+    // IPV6_PKTINFO is required to ensure that the destination IPv6 address matches the source
+    val = 1;
+    if (setsockopt(ipv6Socket, IPPROTO_IPV6, IPV6_RECVPKTINFO, &val, sizeof(val)) == -1) {
+        printf("setsockopt(IPV6_RECVPKTINFO) failed: %d\n", errno);
+        return errno;
+    }
+
+    // Allow both IPv4 and IPv6 on the same socket (optional)
+    val = 1;
+    if (setsockopt(ipv6Socket, IPPROTO_IPV6, IPV6_V6ONLY, &val, sizeof(val)) == -1) {
+        printf("setsockopt(IPV6_V6ONLY) failed: %d\n", errno);
+    }
+
+    RtlZeroMemory(&addr6, sizeof(addr6));
+    addr6.sin6_family = AF_INET6;
+    addr6.sin6_port = htons(Port);
+    if (bind(ipv6Socket, (struct sockaddr*)&addr6, sizeof(addr6)) == -1) {
+        printf("bind() failed: %d\n", errno);
+        return errno;
+    }
+
+    ipv4Socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (ipv4Socket == INVALID_SOCKET) {
+        printf("socket() failed: %d\n", errno);
+        return errno;
+    }
+
+    RtlZeroMemory(&addr, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(ipv4Socket, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+        printf("bind() failed: %d\n", errno);
+        return errno;
+    }
+
+    tuple = (PUDP_TUPLE)malloc(sizeof(*tuple));
+    if (tuple == NULL) {
+        return ERROR_OUTOFMEMORY;
+    }
+
+    tuple->ipv4Socket = *Ipv4Socket = ipv4Socket;
+    tuple->ipv6Socket = *Ipv6Socket = ipv6Socket;
+    tuple->port = Port;
+
+    if (pthread_create(&thread, NULL, UdpRelayThreadProc, tuple) != 0) {
+        printf("pthread_create() failed: %d\n", errno);
+        return errno;
+    }
+    pthread_detach(thread);
+
+    return 0;
+}
+
+#endif // _WIN32
+
+#ifdef _WIN32
 void NETIOAPI_API_ IpInterfaceChangeNotificationCallback(PVOID context, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE)
 {
     SetEvent((HANDLE)context);
 }
+#endif
 
 void UPnPCreatePinholeForPort(struct UPNPUrls* urls, struct IGDdatas* data, int proto, const char* myAddr, int port)
 {
@@ -613,6 +1049,7 @@ void UPnPCreatePinholeForPort(struct UPNPUrls* urls, struct IGDdatas* data, int 
     }
 }
 
+#ifdef _WIN32
 void UPnPCreatePinholesForInterface(struct UPNPUrls* urls, struct IGDdatas* data, const char* tmpAddr)
 {
     PIP_ADAPTER_ADDRESSES addresses;
@@ -692,6 +1129,67 @@ Exit:
     free(addresses);
     return;
 }
+#else // Linux implementation
+void UPnPCreatePinholesForInterface(struct UPNPUrls* urls, struct IGDdatas* data, const char* tmpAddr)
+{
+    struct ifaddrs *ifaddr, *ifa;
+    struct in6_addr targetAddress;
+    char ifname[IF_NAMESIZE] = {0};
+    int foundInterface = 0;
+
+    inet_pton(AF_INET6, tmpAddr, &targetAddress);
+
+    if (getifaddrs(&ifaddr) == -1) {
+        printf("getifaddrs() failed: %d\n", errno);
+        return;
+    }
+
+    // First pass: find the interface with the target address
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET6)
+            continue;
+
+        PSOCKADDR_IN6 currentAddrV6 = (PSOCKADDR_IN6)ifa->ifa_addr;
+        if (memcmp(&currentAddrV6->sin6_addr, &targetAddress, sizeof(targetAddress)) == 0) {
+            strncpy(ifname, ifa->ifa_name, IF_NAMESIZE - 1);
+            foundInterface = 1;
+            break;
+        }
+    }
+
+    if (!foundInterface) {
+        printf("No adapter found with IPv6 address: %s\n", tmpAddr);
+        freeifaddrs(ifaddr);
+        return;
+    }
+
+    // Second pass: create pinholes for all public IPv6 addresses on this interface
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET6)
+            continue;
+        if (strcmp(ifa->ifa_name, ifname) != 0)
+            continue;
+
+        PSOCKADDR_IN6 currentAddrV6 = (PSOCKADDR_IN6)ifa->ifa_addr;
+
+        // Exclude link-local addresses (scope_id != 0 or starts with fe80)
+        if (currentAddrV6->sin6_scope_id == 0 && 
+            !IN6_IS_ADDR_LINKLOCAL(&currentAddrV6->sin6_addr)) {
+            char currentAddrStr[128] = {};
+            inet_ntop(AF_INET6, &currentAddrV6->sin6_addr, currentAddrStr, sizeof(currentAddrStr));
+
+            for (size_t i = 0; i < ARRAYSIZE(TCP_PORTS); i++) {
+                UPnPCreatePinholeForPort(urls, data, IPPROTO_TCP, currentAddrStr, TCP_PORTS[i]);
+            }
+            for (size_t i = 0; i < ARRAYSIZE(UDP_PORTS); i++) {
+                UPnPCreatePinholeForPort(urls, data, IPPROTO_UDP, currentAddrStr, UDP_PORTS[i]);
+            }
+        }
+    }
+
+    freeifaddrs(ifaddr);
+}
+#endif
 
 void UpdateUpnpPinholes()
 {
@@ -699,9 +1197,9 @@ void UpdateUpnpPinholes()
     struct UPNPUrls urls;
     struct IGDdatas data;
     char localAddress[128];
-    char ipv6WanAddr[128] = {};
+    (void)localAddress; // Silence unused variable warning in some code paths
 
-    struct UPNPDev* ipv6Devs = upnpDiscoverAll(5000, nullptr, nullptr, UPNP_LOCAL_PORT_ANY, 1, 2, &upnpErr);
+    struct UPNPDev* ipv6Devs = upnpDiscoverAll(5000, NULL, NULL, UPNP_LOCAL_PORT_ANY, 1, 2, &upnpErr);
     printf("UPnP IPv6 IGD discovery completed with error code: %d\n", upnpErr);
 
     int ret = UPNP_GetValidIGD(ipv6Devs, &urls, &data, localAddress, sizeof(localAddress));
@@ -756,6 +1254,7 @@ void UpdateUpnpPinholes()
     freeUPNPDevlist(ipv6Devs);
 }
 
+#ifdef _WIN32
 void UpdatePcpPinholes()
 {
     PIP_ADAPTER_ADDRESSES addresses;
@@ -1126,4 +1625,269 @@ int main(int argc, char* argv[])
 
     return StartServiceCtrlDispatcher(ServiceTable);
 }
+
+#else // Linux implementation
+
+// Linux: Use /proc/net/route or netlink for getting gateway info
+// For simplicity, we'll use a simpler approach that reads routing info
+
+void UpdatePcpPinholes()
+{
+    struct ifaddrs *ifaddr, *ifa;
+    FILE *routeFile;
+    char line[256];
+    char gateway[64] = {0};
+    int foundGateway = 0;
+    
+    // Try to find the default IPv6 gateway from /proc/net/ipv6_route
+    routeFile = fopen("/proc/net/ipv6_route", "r");
+    if (routeFile != NULL) {
+        while (fgets(line, sizeof(line), routeFile)) {
+            // Look for default route (destination 00000000000000000000000000000000)
+            if (strncmp(line, "00000000000000000000000000000000", 32) == 0) {
+                // Parse gateway from the route entry
+                char destNet[33], destPrefix[3], srcNet[33], srcPrefix[3], nextHop[33];
+                if (sscanf(line, "%32s %2s %32s %2s %32s", destNet, destPrefix, srcNet, srcPrefix, nextHop) >= 5) {
+                    if (strcmp(nextHop, "00000000000000000000000000000000") != 0) {
+                        // Convert hex gateway to IPv6 address string
+                        struct in6_addr addr;
+                        for (int i = 0; i < 16; i++) {
+                            unsigned int byte;
+                            sscanf(nextHop + i*2, "%2x", &byte);
+                            addr.s6_addr[i] = byte;
+                        }
+                        inet_ntop(AF_INET6, &addr, gateway, sizeof(gateway));
+                        foundGateway = 1;
+                        break;
+                    }
+                }
+            }
+        }
+        fclose(routeFile);
+    }
+
+    if (!foundGateway) {
+        printf("No IPv6 gateway found for PCP\n");
+        return;
+    }
+
+    printf("Using PCP server: %s\n", gateway);
+
+    // Get all IPv6 addresses and create PCP mappings
+    if (getifaddrs(&ifaddr) == -1) {
+        printf("getifaddrs() failed: %d\n", errno);
+        return;
+    }
+
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET6)
+            continue;
+
+        PSOCKADDR_IN6 currentAddrV6 = (PSOCKADDR_IN6)ifa->ifa_addr;
+
+        // Exclude link-local addresses
+        if (currentAddrV6->sin6_scope_id == 0 && 
+            !IN6_IS_ADDR_LINKLOCAL(&currentAddrV6->sin6_addr)) {
+            char addressStr[128];
+            inet_ntop(AF_INET6, &currentAddrV6->sin6_addr, addressStr, sizeof(addressStr));
+            printf("Updating PCP mappings for address %s\n", addressStr);
+
+            // Create gateway address structure
+            SOCKADDR_IN6 gatewayAddr;
+            memset(&gatewayAddr, 0, sizeof(gatewayAddr));
+            gatewayAddr.sin6_family = AF_INET6;
+            inet_pton(AF_INET6, gateway, &gatewayAddr.sin6_addr);
+
+            for (size_t i = 0; i < ARRAYSIZE(TCP_PORTS); i++) {
+                PCPMapPort(
+                    (PSOCKADDR_STORAGE)currentAddrV6,
+                    sizeof(*currentAddrV6),
+                    (PSOCKADDR_STORAGE)&gatewayAddr,
+                    sizeof(gatewayAddr),
+                    IPPROTO_TCP,
+                    TCP_PORTS[i],
+                    true,
+                    false);
+            }
+            for (size_t i = 0; i < ARRAYSIZE(UDP_PORTS); i++) {
+                PCPMapPort(
+                    (PSOCKADDR_STORAGE)currentAddrV6,
+                    sizeof(*currentAddrV6),
+                    (PSOCKADDR_STORAGE)&gatewayAddr,
+                    sizeof(gatewayAddr),
+                    IPPROTO_UDP,
+                    UDP_PORTS[i],
+                    true,
+                    false);
+            }
+        }
+    }
+
+    freeifaddrs(ifaddr);
+}
+
+void ResetLogFile(bool standaloneExe)
+{
+    char timeString[256] = {};
+    time_t now;
+    struct tm *tm_info;
+
+    if (!standaloneExe) {
+        const char* logDir = "/var/log/gsv6fwd";
+        char oldLogFilePath[256];
+        char currentLogFilePath[256];
+
+        // Create log directory if it doesn't exist
+        mkdir(logDir, 0755);
+
+        snprintf(oldLogFilePath, sizeof(oldLogFilePath), "%s/GSv6Fwd-old.log", logDir);
+        snprintf(currentLogFilePath, sizeof(currentLogFilePath), "%s/GSv6Fwd-current.log", logDir);
+
+        // Rotate the current to the old log file
+        rename(currentLogFilePath, oldLogFilePath);
+
+        // Redirect stdout to this new file
+        if (freopen(currentLogFilePath, "w", stdout) == NULL) {
+            // If we couldn't create a log file, just redirect stdout to /dev/null.
+            FILE* devnull = freopen("/dev/null", "w", stdout);
+            (void)devnull;  // Suppress unused variable warning
+        }
+    }
+
+    // Print a log header
+    printf("IPv6 Forwarder for GameStream v" VER_VERSION_STR "\n");
+
+    // Print the current time
+    time(&now);
+    tm_info = gmtime(&now);
+    strftime(timeString, sizeof(timeString), "%H:%M:%S", tm_info);
+    printf("The current UTC time is: %s\n", timeString);
+}
+
+void StartRelay(SOCKET* tcpSockets, SOCKET* udpSockets) {
+    int err;
+
+    for (size_t i = 0; i < ARRAYSIZE(TCP_PORTS); i++) {
+        err = StartTcpRelay(TCP_PORTS[i], &tcpSockets[i]);
+        if (err != 0) {
+            printf("Failed to start relay on TCP %d: %d\n", TCP_PORTS[i], err);
+            tcpSockets[i] = INVALID_SOCKET;
+        }
+    }
+
+    for (size_t i = 0; i < ARRAYSIZE(UDP_PORTS); i++) {
+        err = StartUdpRelay(UDP_PORTS[i], &udpSockets[i * 2], &udpSockets[i * 2 + 1]);
+        if (err != 0) {
+            printf("Failed to start relay on UDP %d: %d\n", UDP_PORTS[i], err);
+            udpSockets[i * 2] = udpSockets[i * 2 + 1] = INVALID_SOCKET;
+        }
+    }
+}
+
+static volatile int g_running = 1;
+
+void signal_handler(int sig)
+{
+    (void)sig;
+    g_running = 0;
+}
+
+int Run(bool standaloneExe)
+{
+    ResetLogFile(standaloneExe);
+
+    // Keep track of TCP and UDP sockets for the relays.
+    SOCKET tcpSockets[ARRAYSIZE(TCP_PORTS)] = {INVALID_SOCKET};
+    SOCKET udpSockets[ARRAYSIZE(UDP_PORTS) * 2] = {INVALID_SOCKET};
+
+    // On Linux, we always start the relay (no GameStream registry check)
+    printf("Starting IPv6 relay...\n");
+    StartRelay(tcpSockets, udpSockets);
+
+    // Setup signal handler for graceful shutdown
+    signal(SIGTERM, signal_handler);
+    signal(SIGINT, signal_handler);
+
+    while (g_running) {
+        printf("Updating UPnP/PCP pinholes...\n");
+        UpdatePcpPinholes();
+        UpdateUpnpPinholes();
+
+        printf("Going to sleep...\n");
+        fflush(stdout);
+
+        // Sleep for 120 seconds (same as Windows), checking for shutdown periodically
+        for (int i = 0; i < 120 && g_running; i++) {
+            sleep(1);
+        }
+
+        if (g_running) {
+            ResetLogFile(standaloneExe);
+            printf("Woke up on refresh timer\n");
+        }
+    }
+
+    printf("Shutting down...\n");
+
+    // Close all sockets
+    for (size_t i = 0; i < ARRAYSIZE(tcpSockets); i++) {
+        if (tcpSockets[i] != INVALID_SOCKET) {
+            shutdown(tcpSockets[i], SHUT_RDWR);
+            close(tcpSockets[i]);
+        }
+    }
+    for (size_t i = 0; i < ARRAYSIZE(udpSockets); i++) {
+        if (udpSockets[i] != INVALID_SOCKET) {
+            shutdown(udpSockets[i], SHUT_RDWR);
+            close(udpSockets[i]);
+        }
+    }
+
+    return 0;
+}
+
+int main(int argc, char* argv[])
+{
+    bool daemon_mode = false;
+
+    // Parse command line arguments
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--daemon") == 0) {
+            daemon_mode = true;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            printf("Usage: %s [options]\n", argv[0]);
+            printf("Options:\n");
+            printf("  -d, --daemon    Run as daemon (background)\n");
+            printf("  -h, --help      Show this help message\n");
+            printf("\nIPv6 Forwarder for GameStream - Allows Moonlight clients to connect over IPv6\n");
+            return 0;
+        }
+    }
+
+    if (daemon_mode) {
+        // Daemonize
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork failed");
+            return 1;
+        }
+        if (pid > 0) {
+            // Parent exits
+            return 0;
+        }
+        // Child continues
+        setsid();
+        
+        // Close standard file descriptors
+        close(STDIN_FILENO);
+        
+        Run(false);
+    } else {
+        Run(true);
+    }
+
+    return 0;
+}
+
+#endif // _WIN32
 
