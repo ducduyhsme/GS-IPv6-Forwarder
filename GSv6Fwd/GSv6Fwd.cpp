@@ -973,7 +973,7 @@ int StartUdpRelay(unsigned short Port, SOCKET* Ipv4Socket, SOCKET* Ipv6Socket)
         return errno;
     }
 
-    // Allow both IPv4 and IPv6 on the same socket (optional)
+    // Restrict socket to IPv6 only (we have a separate IPv4 socket)
     val = 1;
     if (setsockopt(ipv6Socket, IPPROTO_IPV6, IPV6_V6ONLY, &val, sizeof(val)) == -1) {
         printf("setsockopt(IPV6_V6ONLY) failed: %d\n", errno);
