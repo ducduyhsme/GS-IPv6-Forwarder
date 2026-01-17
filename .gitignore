@@ -291,3 +291,6 @@ __pycache__/
 *.o
 gsv6fwd
 gsv6fwd.service
+
+# CodeQL
+_codeql*
